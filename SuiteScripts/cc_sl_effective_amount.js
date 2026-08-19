@@ -3,242 +3,153 @@
  * @NScriptType Suitelet
  * @NModuleScope SameAccount
  *
- * Effective Amount viewer.
+ * Read-only "This Year" revenue widget.
  *
- * Shows transaction lines with the billed/effective amount formula:
+ * Sums the billed/effective amount formula for the current year to date and
+ * shows the same period last year underneath:
  *
  *   CASE WHEN {closed} = 'T' or {quantity} = 0
  *        THEN (CASE WHEN {item} = 'Package Discount' THEN {amount}
  *                   ELSE {rate} * {quantitybilled} END)
  *        ELSE {amount} END
+ *
+ * Designed to sit in a Custom Content dashboard portlet pointed at the
+ * deployment URL. No filters, no inputs - display only.
  */
-define(['N/search', 'N/ui/serverWidget', 'N/log'], function (search, serverWidget, log) {
+define(['N/search', 'N/format', 'N/log'], function (search, format, log) {
 
     var EFFECTIVE_AMOUNT_FORMULA =
         "CASE WHEN {closed} = 'T' or {quantity} = 0 " +
         "THEN (CASE WHEN {item} = 'Package Discount' THEN {amount} ELSE {rate} * {quantitybilled} END) " +
         "ELSE {amount} END";
 
-    var MAX_ROWS = 5000;   // guard rail so the page stays inside governance
-    var PAGE_SIZE = 1000;
+    // ---- Configuration ------------------------------------------------------
+    var TRANSACTION_TYPES = ['SalesOrd'];   // types included in the total
+    var FISCAL_YEAR_START_MONTH = 1;        // 1 = calendar year, 7 = Jul-Jun FY
+    var LIKE_FOR_LIKE = true;               // true = prior year to same date,
+                                            // false = the full prior year
+    var HEADING = 'THIS YEAR';
+    // -------------------------------------------------------------------------
 
     function onRequest(context) {
-        var params = context.request.parameters || {};
-        // Only search once the user has asked for it, so opening the Suitelet
-        // cold does not fire an unfiltered transaction search.
-        var shouldRun = context.request.method === 'POST' || params.custpage_run === 'T';
+        var current = buildPeriod(0);
+        var prior = buildPeriod(1);
 
-        var rows = [];
-        var error = null;
-
-        if (shouldRun) {
-            try {
-                rows = runSearch(params);
-            } catch (e) {
-                log.error({ title: 'Effective Amount search failed', details: e });
-                error = e.message || String(e);
-            }
+        try {
+            current.total = sumEffectiveAmount(current.start, current.end);
+            prior.total = sumEffectiveAmount(prior.start, prior.end);
+        } catch (e) {
+            log.error({ title: 'Effective Amount widget failed', details: e });
         }
 
-        var form = serverWidget.createForm({ title: 'Effective Amount by Line' });
+        context.response.write({ output: render(current, prior) });
+    }
 
-        if (error) {
-            form.addField({
-                id: 'custpage_error',
-                type: serverWidget.FieldType.INLINEHTML,
-                label: 'Error'
-            }).defaultValue = '<p style="color:#c00;font-weight:bold;">Search failed: ' +
-                escapeHtml(error) + '</p>';
+    /**
+     * Period 0 is the current year to date, period 1 the same window a year
+     * back (or the whole prior year when LIKE_FOR_LIKE is off).
+     */
+    function buildPeriod(yearsBack) {
+        var today = new Date();
+        var startYear = today.getFullYear() - yearsBack;
+
+        // Before the fiscal year rolls over we are still inside the year that
+        // started last calendar year.
+        if (today.getMonth() + 1 < FISCAL_YEAR_START_MONTH) {
+            startYear -= 1;
         }
 
-        addFilters(form, params);
-        form.addSubmitButton({ label: 'Run' });
+        var start = new Date(startYear, FISCAL_YEAR_START_MONTH - 1, 1);
+        var end;
 
-        var label = shouldRun && !error
-            ? 'Results (' + rows.length + (rows.length >= MAX_ROWS ? '+, truncated' : '') + ')'
-            : 'Results';
-        var sublist = addSublist(form, label);
-        populate(sublist, rows);
+        if (yearsBack === 0) {
+            end = today;
+        } else if (LIKE_FOR_LIKE) {
+            end = new Date(today.getFullYear() - yearsBack, today.getMonth(), today.getDate());
+        } else {
+            end = new Date(startYear + 1, FISCAL_YEAR_START_MONTH - 1, 0); // day before it rolls
+        }
 
-        context.response.writePage(form);
+        return { label: periodLabel(startYear), start: start, end: end, total: null };
     }
 
-    function addFilters(form, params) {
-        form.addFieldGroup({ id: 'custpage_grp_filters', label: 'Filters' });
-
-        var type = form.addField({
-            id: 'custpage_type',
-            type: serverWidget.FieldType.SELECT,
-            label: 'Transaction Type',
-            container: 'custpage_grp_filters'
-        });
-        type.addSelectOption({ value: '', text: '- All -' });
-        type.addSelectOption({ value: 'SalesOrd', text: 'Sales Order' });
-        type.addSelectOption({ value: 'PurchOrd', text: 'Purchase Order' });
-        type.addSelectOption({ value: 'CustInvc', text: 'Invoice' });
-        type.addSelectOption({ value: 'ItemShip', text: 'Item Fulfilment' });
-        type.defaultValue = params.custpage_type || 'SalesOrd';
-
-        form.addField({
-            id: 'custpage_datefrom',
-            type: serverWidget.FieldType.DATE,
-            label: 'Date From',
-            container: 'custpage_grp_filters'
-        }).defaultValue = params.custpage_datefrom || '';
-
-        form.addField({
-            id: 'custpage_dateto',
-            type: serverWidget.FieldType.DATE,
-            label: 'Date To',
-            container: 'custpage_grp_filters'
-        }).defaultValue = params.custpage_dateto || '';
-
-        form.addField({
-            id: 'custpage_docnum',
-            type: serverWidget.FieldType.TEXT,
-            label: 'Document Number (contains)',
-            container: 'custpage_grp_filters'
-        }).defaultValue = params.custpage_docnum || '';
-
-        var run = form.addField({
-            id: 'custpage_run',
-            type: serverWidget.FieldType.TEXT,
-            label: 'Run'
-        });
-        run.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
-        run.defaultValue = 'T';
+    function periodLabel(startYear) {
+        if (FISCAL_YEAR_START_MONTH === 1) {
+            return String(startYear);
+        }
+        return 'FY' + String((startYear + 1) % 100 + 100).slice(1);
     }
 
-    function addSublist(form, label) {
-        var sublist = form.addSublist({
-            id: 'custpage_results',
-            type: serverWidget.SublistType.LIST,
-            label: label
-        });
-
-        sublist.addField({ id: 'custpage_col_date', type: serverWidget.FieldType.TEXT, label: 'Date' });
-        sublist.addField({ id: 'custpage_col_type', type: serverWidget.FieldType.TEXT, label: 'Type' });
-        sublist.addField({ id: 'custpage_col_doc', type: serverWidget.FieldType.TEXT, label: 'Document #' });
-        sublist.addField({ id: 'custpage_col_entity', type: serverWidget.FieldType.TEXT, label: 'Name' });
-        sublist.addField({ id: 'custpage_col_item', type: serverWidget.FieldType.TEXT, label: 'Item' });
-        sublist.addField({ id: 'custpage_col_closed', type: serverWidget.FieldType.TEXT, label: 'Closed' });
-        sublist.addField({ id: 'custpage_col_qty', type: serverWidget.FieldType.TEXT, label: 'Quantity' });
-        sublist.addField({ id: 'custpage_col_qtybilled', type: serverWidget.FieldType.TEXT, label: 'Qty Billed' });
-        sublist.addField({ id: 'custpage_col_rate', type: serverWidget.FieldType.TEXT, label: 'Rate' });
-        sublist.addField({ id: 'custpage_col_amount', type: serverWidget.FieldType.TEXT, label: 'Amount' });
-        sublist.addField({ id: 'custpage_col_effective', type: serverWidget.FieldType.TEXT, label: 'Effective Amount' });
-
-        return sublist;
-    }
-
-    function runSearch(params) {
+    function sumEffectiveAmount(startDate, endDate) {
         var filters = [
             ['mainline', search.Operator.IS, 'F'],
             'AND', ['taxline', search.Operator.IS, 'F'],
-            'AND', ['shipping', search.Operator.IS, 'F']
+            'AND', ['shipping', search.Operator.IS, 'F'],
+            'AND', ['type', search.Operator.ANYOF, TRANSACTION_TYPES],
+            'AND', ['trandate', search.Operator.WITHIN, toSearchDate(startDate), toSearchDate(endDate)]
         ];
 
-        if (params.custpage_type) {
-            filters.push('AND', ['type', search.Operator.ANYOF, params.custpage_type]);
-        }
-        if (params.custpage_datefrom && params.custpage_dateto) {
-            filters.push('AND', ['trandate', search.Operator.WITHIN, params.custpage_datefrom, params.custpage_dateto]);
-        } else if (params.custpage_datefrom) {
-            filters.push('AND', ['trandate', search.Operator.ONORAFTER, params.custpage_datefrom]);
-        } else if (params.custpage_dateto) {
-            filters.push('AND', ['trandate', search.Operator.ONORBEFORE, params.custpage_dateto]);
-        }
-        if (params.custpage_docnum) {
-            filters.push('AND', ['numbertext', search.Operator.CONTAINS, params.custpage_docnum]);
-        }
+        // A formula column has to be read back with the same column object,
+        // not by name.
+        var totalColumn = search.createColumn({
+            name: 'formulacurrency',
+            formula: EFFECTIVE_AMOUNT_FORMULA,
+            summary: search.Summary.SUM
+        });
 
-        // Keep the column objects around - a formula column has to be read back
-        // with the same column object, not by name.
-        var cols = {
-            date:      search.createColumn({ name: 'trandate', sort: search.Sort.DESC }),
-            type:      search.createColumn({ name: 'type' }),
-            doc:       search.createColumn({ name: 'tranid' }),
-            entity:    search.createColumn({ name: 'entity' }),
-            item:      search.createColumn({ name: 'item' }),
-            closed:    search.createColumn({ name: 'closed' }),
-            qty:       search.createColumn({ name: 'quantity' }),
-            qtybilled: search.createColumn({ name: 'quantitybilled' }),
-            rate:      search.createColumn({ name: 'rate' }),
-            amount:    search.createColumn({ name: 'amount' }),
-            effective: search.createColumn({
-                name: 'formulacurrency',
-                formula: EFFECTIVE_AMOUNT_FORMULA,
-                label: 'Effective Amount'
-            })
-        };
-
-        var srch = search.create({
+        var results = search.create({
             type: search.Type.TRANSACTION,
             filters: filters,
-            columns: [cols.date, cols.type, cols.doc, cols.entity, cols.item,
-                      cols.closed, cols.qty, cols.qtybilled, cols.rate, cols.amount, cols.effective]
-        });
+            columns: [totalColumn]
+        }).run().getRange({ start: 0, end: 1 });
 
-        var rows = [];
-        var paged = srch.runPaged({ pageSize: PAGE_SIZE });
-
-        paged.pageRanges.forEach(function (range) {
-            if (rows.length >= MAX_ROWS) return;
-            paged.fetch({ index: range.index }).data.forEach(function (r) {
-                if (rows.length >= MAX_ROWS) return;
-                var closed = r.getValue(cols.closed);
-                rows.push({
-                    date:      r.getValue(cols.date),
-                    type:      r.getText(cols.type) || r.getValue(cols.type),
-                    doc:       r.getValue(cols.doc),
-                    entity:    r.getText(cols.entity) || r.getValue(cols.entity),
-                    item:      r.getText(cols.item) || r.getValue(cols.item),
-                    closed:    (closed === true || closed === 'T') ? 'Yes' : 'No',
-                    qty:       r.getValue(cols.qty),
-                    qtybilled: r.getValue(cols.qtybilled),
-                    rate:      r.getValue(cols.rate),
-                    amount:    r.getValue(cols.amount),
-                    effective: r.getValue(cols.effective)
-                });
-            });
-        });
-
-        return rows;
-    }
-
-    function populate(sublist, rows) {
-        var total = 0;
-
-        rows.forEach(function (row, i) {
-            setLine(sublist, 'custpage_col_date', i, row.date);
-            setLine(sublist, 'custpage_col_type', i, row.type);
-            setLine(sublist, 'custpage_col_doc', i, row.doc);
-            setLine(sublist, 'custpage_col_entity', i, row.entity);
-            setLine(sublist, 'custpage_col_item', i, row.item);
-            setLine(sublist, 'custpage_col_closed', i, row.closed);
-            setLine(sublist, 'custpage_col_qty', i, num(row.qty));
-            setLine(sublist, 'custpage_col_qtybilled', i, num(row.qtybilled));
-            setLine(sublist, 'custpage_col_rate', i, num(row.rate));
-            setLine(sublist, 'custpage_col_amount', i, num(row.amount));
-            setLine(sublist, 'custpage_col_effective', i, num(row.effective));
-
-            total += parseFloat(row.effective) || 0;
-        });
-
-        if (rows.length) {
-            setLine(sublist, 'custpage_col_item', rows.length, 'TOTAL');
-            setLine(sublist, 'custpage_col_effective', rows.length, num(total));
+        if (!results.length) {
+            return 0;
         }
+
+        return parseFloat(results[0].getValue(totalColumn)) || 0;
     }
 
-    function setLine(sublist, id, line, value) {
-        if (value === null || value === undefined || value === '') return;
-        sublist.setSublistValue({ id: id, line: line, value: String(value) });
+    function toSearchDate(date) {
+        return format.format({ value: date, type: format.Type.DATE });
     }
 
-    function num(value) {
-        var n = parseFloat(value);
-        return isNaN(n) ? '' : n.toFixed(2);
+    function render(current, prior) {
+        return '<!DOCTYPE html>' +
+            '<html><head><meta charset="utf-8">' +
+            '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+            '<style>' +
+            'html,body{margin:0;padding:0;background:#0f151d;' +
+            'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
+            '.wrap{padding:14px 16px 18px;}' +
+            '.heading{color:#8b95a5;font-size:11px;font-weight:700;letter-spacing:1.4px;' +
+            'text-align:center;margin:0 0 12px;}' +
+            '.card{background:#161d27;border:1px solid #263041;border-radius:10px;padding:16px 18px 14px;}' +
+            '.year{color:#8b95a5;font-size:12px;font-weight:700;margin-bottom:4px;}' +
+            '.value{color:#f2f5f9;font-size:36px;font-weight:700;letter-spacing:-0.5px;line-height:1.1;}' +
+            '.prior{border-top:1px solid #263041;margin-top:14px;padding-top:10px;' +
+            'color:#8b95a5;font-size:13px;}' +
+            '.prior .prior-year{font-weight:700;margin-right:10px;}' +
+            '</style></head><body>' +
+            '<div class="wrap">' +
+            '<div class="heading">' + escapeHtml(HEADING) + '</div>' +
+            '<div class="card">' +
+            '<div class="year">' + escapeHtml(current.label) + '</div>' +
+            '<div class="value">' + money(current.total) + '</div>' +
+            '<div class="prior">' +
+            '<span class="prior-year">' + escapeHtml(prior.label) + '</span>' +
+            '<span>' + money(prior.total) + '</span>' +
+            '</div>' +
+            '</div></div></body></html>';
+    }
+
+    function money(value) {
+        if (value === null || value === undefined || isNaN(value)) {
+            return '&mdash;';
+        }
+        var rounded = Math.round(Math.abs(value)).toString();
+        var withCommas = rounded.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        return (value < 0 ? '-$' : '$') + withCommas;
     }
 
     function escapeHtml(s) {
